@@ -1,0 +1,24 @@
+ROULETTE PRO AI V2.9.40 BLOKLU MASA ATLA KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları mevcut program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.40 BLOK ATLA yazmalı.
+
+KULLANIM
+1. VERİ panelinden şuna bas:
+   TEK SEKME LOBİ TOPLA • 5 DK
+2. Program normal SON500 olan masalarda 500 spin verisini kaydeder.
+3. PowerUp Rulet gibi bloklu masaları lobi kartında görürse tıklamaz.
+4. Bloklu masa zaten açılmışsa hemen Lobi düğmesine basar ve sıradaki masaya geçer.
+5. Sıcak & Soğuk-only paneli varsa ve SON500 yoksa yine atlar.
+
+500 SPİN KONTROLÜ
+- VERİ DURUMU: PRAGMATIC DIRECT 500/500 veya statisticHistory network 500/500
+- UZUN MASA ARŞİVİ: 500+
+- MASA BANKALARINI GÖR: tüm masa kayıtları ve spin sayıları

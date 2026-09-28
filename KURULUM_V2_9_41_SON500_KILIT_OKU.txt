@@ -1,0 +1,22 @@
+ROULETTE PRO AI V2.9.41 SON500 KİLİT OKU KURULUM
+
+KURULUM
+1. ZIP dosyasını tamamen klasöre çıkar.
+2. İçindeki dosyaları mevcut program klasörüne kopyala.
+3. Sorarsa üzerine yaz.
+4. Programı çalıştır:
+   BASLAT_ROULETTE_V2_9_12_MULTI_TABLE_COLLECTOR.bat
+
+KONTROL
+- Üst başlıkta V2.9.41 KİLİT OKU yazmalı.
+
+KULLANIM
+1. VERİ panelinden şuna bas:
+   TEK SEKME LOBİ TOPLA • 10 DK
+2. Masa açıldığında SON500 paneli görünüyorsa program artık masayı lobi sanmaz.
+3. 'masa açık • SON500 paneli görüldü • 500 spin okunuyor' yazısından sonra 500/500 veri kaydı yapılır.
+4. Veri alınınca oyun içi Lobi düğmesine basar ve sıradaki masaya geçer.
+5. PowerUp Rulet / Sıcak & Soğuk-only masalar atlanır.
+
+NOT
+- Bu sürüm özellikle 'SON500 paneli ekranda var ama program Rulet lobisi yazıp ilk masada kaldı' sorunu için yapıldı.
