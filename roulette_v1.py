@@ -64,6 +64,10 @@ LIVE_RESYNC_CONFIRMATIONS = 3
 # V2.9.43: a complete game window may bootstrap the live view when there is
 # no live history yet. The LIVE LOCK still protects an established SON20.
 LIVE_BOOTSTRAP_MIN_NUMBERS = 20
+# V2.9.44: an endpoint may answer oldest-first. detect_new_front only
+# compares forward, so the mirrored window is tried before the LIVE LOCK
+# gives up. An unrelated window cannot match in either orientation.
+
 # Only recover when the live feed itself has been silent for this long, and
 # never re-anchor more often than this. A healthy feed never reaches the
 # LIVE LOCK branch, so an idle gate keeps unrelated widgets from hijacking
@@ -1000,16 +1004,20 @@ def detect_new_front(old_history, new_history, max_new=DETECT_MAX_NEW):
         return []
 
     max_k = min(max_new, len(new))
+    # The floor must NOT be clamped by `remaining`: a short tail would then
+    # lower the bar to a single number, and one coincidental match at the end
+    # of an unrelated window "proved" many new spins.
+    needed = min(DOM_MIN_OVERLAP, len(old))
     for k in range(1, max_k + 1):
         remaining = len(new) - k
         if remaining < 1:
             # k == len(new) would compare two empty slices and "prove"
             # a whole unrelated window as new. Never allow that.
             continue
+        if remaining < needed:
+            # Too few shared numbers left to prove continuity at all.
+            continue
         overlap = min(remaining, len(old))
-        # Match as many numbers as both sides actually expose, but never
-        # accept a single coincidental number as proof of a new spin.
-        needed = min(DOM_MIN_OVERLAP, len(old), remaining)
         if overlap < needed:
             continue
         if new[k:k+overlap] == old[:overlap]:
@@ -6208,20 +6216,50 @@ class RouletteState:
                     elif clean[:20] == self.history:
                         pass
                     else:
-                        # V2.8.0 LIVE LOCK:
-                        # A source that cannot prove newest-first continuity
-                        # is NOT allowed to mutate the visible live history.
-                        # This prevents stale DOM widgets, mis-oriented SON500,
-                        # or unrelated result grids from changing SON SAYI/SON20.
-                        #
-                        # The data source may still be used elsewhere for
-                        # archive/model analysis, but live history stays intact.
-                        #
-                        # V2.9.42: a provably stale anchor used to freeze the
-                        # screen forever here. Offer the window to the
-                        # self-heal check before giving up on it.
-                        self._note_live_resync(clean[:20], source)
-                        return
+                        # V2.9.44: the endpoint may answer oldest-first.
+                        # `detect_new_front` only compares forward, so a
+                        # perfectly valid window was rejected on every single
+                        # hand and the live view froze while the game kept
+                        # spinning. Try the mirrored window first; an unrelated
+                        # window still cannot match in either orientation, so
+                        # the LIVE LOCK below keeps its full strength.
+                        mirrored_new = detect_new_front(
+                            self.history,
+                            list(reversed(clean[:20])),
+                            max_new=12,
+                        )
+                        if mirrored_new:
+                            clean = list(reversed(clean))
+                            new_items = mirrored_new
+                            temp_hist = list(self.history)
+                            for actual in reversed(new_items):
+                                self._safe_score_pending(actual)
+                                self.session_results.append(int(actual))
+                                temp_hist = [int(actual)] + temp_hist[:19]
+                                self.pending_prediction = self._make_prediction(
+                                    temp_hist
+                                )
+                            self.history = clean[:20]
+                            self.pending_prediction = self._make_prediction(
+                                self.history
+                            )
+                            self.last_live_apply = time.time()
+                            self._save_learning()
+                        else:
+                            # V2.8.0 LIVE LOCK:
+                            # A source that cannot prove newest-first continuity
+                            # is NOT allowed to mutate the visible live history.
+                            # This prevents stale DOM widgets, mis-oriented SON500,
+                            # or unrelated result grids from changing SON SAYI/SON20.
+                            #
+                            # The data source may still be used elsewhere for
+                            # archive/model analysis, but live history stays intact.
+                            #
+                            # V2.9.42: a provably stale anchor used to freeze the
+                            # screen forever here. Offer the window to the
+                            # self-heal check before giving up on it.
+                            self._note_live_resync(clean[:20], source)
+                            return
 
             if hot:
                 self.hot = [
@@ -12496,7 +12534,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.43 • CANLI GÖRÜNÜM DÜZELTMESİ")
+        self.root.title("Roulette Pro AI V2.9.44 • CANLI TAHMİN DÜZELTMESİ")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -12667,7 +12705,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.43 CANLI GÖRÜNÜM DÜZELTMESİ",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.44 CANLI TAHMİN DÜZELTMESİ",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")

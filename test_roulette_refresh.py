@@ -331,7 +331,60 @@ class LiveFreezeRegressionTests(unittest.TestCase):
                 self.assertEqual(state.score_error_status, "OK")
                 self.assertEqual(len(state.display_compare_batch), 12)
 
+    def test_oldest_first_api_window_keeps_scoring_every_hand(self):
+        # V2.9.44: `detect_new_front` only compares forward. An endpoint that
+        # answers oldest-first (newest last) was therefore rejected on EVERY
+        # hand: the prediction was produced but never ran, GEÇMİŞ/K1/K2 stayed
+        # at zero and the screen froze while the game kept spinning.
+        state = self.state
+        state.update_results(self.stream[:20], table_name="Table1", source="API")
+        self.assertEqual(int(state.history[0]), int(self.stream[0]))
+        base_trials = int((state.validation or {}).get("trials", 0) or 0)
+
+        head = self.stream[:20]
+        for hand, spin in enumerate(self.stream[20:32], 1):
+            # Endpoint renders the window oldest-first.
+            oldest_first = list(reversed([spin] + head[:19]))
+            state.update_results(
+                oldest_first, table_name="Table1", source="Pragmatic API"
+            )
+            self.assertEqual(
+                int(state.history[0]), int(spin),
+                f"{hand}. elde canlı görünüm ilerlemedi (yön hâlâ yanlış)",
+            )
+            self.assertEqual(
+                hand,
+                int((state.validation or {}).get("trials", 0)) - base_trials,
+                f"{hand}. elde tur puanlanmadı",
+            )
+            self.assertEqual(hand, len(state.display_compare_batch))
+            self.assertEqual(hand, len(state.neighbor_display_batch))
+            self.assertEqual(hand, len(state.neighbor1_display_batch))
+            head = [spin] + head[:19]
+
+        self.assertEqual(state.score_error_status, "OK")
+
+    def test_unrelated_window_still_cannot_prove_new_spins_in_either_orientation(self):
+        state = self.state
+        state.update_results(self.stream[:20], table_name="Table1", source="API")
+        before = list(state.history)
+        for orientation in ("forward", "reversed"):
+            with self.subTest(orientation=orientation):
+                unrelated = [(i * 17 + 5) % 37 for i in range(20)]
+                if orientation == "reversed":
+                    unrelated = list(reversed(unrelated))
+                for _ in range(6):
+                    state.update_results(
+                        unrelated, table_name="Table1", source="Pragmatic API"
+                    )
+                self.assertEqual(state.history, before)
+                self.assertEqual(state.live_resync_count, 0)
+                self.assertEqual(len(state.display_compare_batch), 0)
+
     def test_detect_new_front_still_requires_a_real_overlap(self):
+        # V2.9.44: `needed` used to be clamped by `remaining`, so a short tail
+        # lowered the bar to ONE number and a coincidental match at the end of
+        # an unrelated window "proved" many new spins.
         history = [7, 14, 21, 28, 35, 3, 9, 18, 26, 1, 32, 5, 12, 30, 11, 24]
         # One coincidentally equal number is not proof of a new spin.
         self.assertEqual(roulette.detect_new_front(history, [7, 2, 4, 6, 8]), [])
@@ -340,6 +393,11 @@ class LiveFreezeRegressionTests(unittest.TestCase):
             roulette.detect_new_front(history, [13] + history[:5]),
             [13],
         )
+        # A short tail must not lower the overlap floor to one number: here the
+        # only match is the single last element of the reversed window, which
+        # used to "prove" nine new spins.
+        tail_match = list(reversed([7, 14, 21, 28, 35, 3, 9, 18, 26, 1]))
+        self.assertEqual(roulette.detect_new_front(history, tail_match), [])
 
 
 if __name__ == "__main__":

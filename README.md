@@ -61,3 +61,28 @@ Yapılanlar:
   arşive karşı denenir; en eskiden en yeniye veren ağ yanıtı böylece tanınır.
 
 Çevrimdışı regresyon testleri: `python -m unittest -v test_roulette_refresh.py`
+
+
+## V2.9.44 — CANLI TAHMİN DÜZELTMESİ (en eskiden yeniye veren uç nokta)
+
+Masa açık, veri geliyor ama **tahmin yürütülmüyor**: GEÇMİŞ / K1 / K2 hiç artmıyor,
+tur sayacı 0'da kalıyor ve ekran aynı kalıyordu.
+
+Nedeni: `detect_new_front()` yalnızca **ileri yönlü** karşılaştırma yapıyordu. Bazı
+Pragmatic/operatör uç noktaları `last20Results` listesini **en eskiden en yeniye**
+(en yeni sonda) veriyor; bu yüzden her el LIVE LOCK'a takılıyor, canlı geçmiş hiç
+güncellenmiyor ve tahmin hiç puanlanmıyordu.
+
+Yapılanlar:
+
+* `update_results()` artık LIVE LOCK'a düşmeden önce **ayna pencereyi** (ters
+  çevrilmiş listeyi) de dener. İlişkisiz bir liste iki yönde de eşleşemez, bu yüzden
+  LIVE LOCK tam korumasını korur (testle sabitlendi).
+* `detect_new_front()` güvenlik açığı kapatıldı: eşleşme eşiği `remaining` ile
+  kırpıldığı için kısa bir kuyrukta bar **tek sayıya** düşüyor ve tesadüfen eşleşen
+  bir sayı "birçok yeni spin" olarak kanıtlanıyordu. Artık eşik sabit; kısa kuyruk
+  hiç kanıt kabul edilmiyor.
+* GEÇMİŞ sekmesindeki tur sayacı ve K1/K2 kazanma sayaçları bu düzeltmeyle birlikte
+  gerçekten ilerliyor.
+
+Çevrimdışı regresyon testleri: `python -m unittest -v test_roulette_refresh.py`
