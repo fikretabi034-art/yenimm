@@ -144,5 +144,130 @@ class TableRefreshTests(unittest.TestCase):
         self.assertEqual(again.neighbor_display_batch, [])
 
 
+class LiveFreezeRegressionTests(unittest.TestCase):
+    """V2.9.42: the live view used to freeze after the very first hand."""
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        patcher = patch.object(roulette, "persistent_data_dir", return_value=self.temp.name)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.state = roulette.RouletteState()
+        self.state.set_pragmatic_identity("T1", title="Table1")
+        # Deterministic spin stream, newest-first windows are built from it.
+        self.stream = [(i * 11 + i * i // 7) % 37 for i in range(60)]
+
+    def feed_dom_widget(self, window, source="DOM canlı kilitli"):
+        chosen = roulette.choose_live_dom_candidate(
+            [{"nums": list(window), "cls": "recent-results"}],
+            list(self.state.history),
+        )
+        if not chosen:
+            return False
+        self.state.update_results(
+            chosen["nums"],
+            table_name="Table1",
+            source=source,
+        )
+        return True
+
+    def test_short_live_widget_no_longer_freezes_after_first_hand(self):
+        # Several Pragmatic skins render only 5..8 recent numbers. The old
+        # fixed 8-number overlap made such a widget unmatchable forever:
+        # the bootstrap read worked and every later spin proved nothing.
+        widget_size = 6
+        first = self.stream[:widget_size]
+        self.assertTrue(self.feed_dom_widget(first))
+        self.assertEqual(self.state.history, list(first))
+
+        for index, spin in enumerate(self.stream[widget_size:widget_size + 15], 1):
+            window = ([spin] + first)[:widget_size]
+            self.assertTrue(
+                self.feed_dom_widget(window),
+                f"{index}. elde DOM penceresi eşleştirilemedi (ekran dondu)",
+            )
+            self.assertEqual(int(self.state.history[0]), int(spin))
+            first = window
+            self.assertEqual((index - 1) % 12 + 1, len(self.state.display_compare_batch))
+
+        self.assertEqual(self.state.score_error_status, "OK")
+
+    def test_eight_number_widget_against_long_live_history(self):
+        long_window = self.stream[:20]
+        self.state.update_results(long_window, table_name="Table1", source="API")
+        self.assertEqual(len(self.state.history), 20)
+
+        for spin in self.stream[20:26]:
+            self.assertTrue(self.feed_dom_widget([spin] + long_window[:7]))
+            self.assertEqual(int(self.state.history[0]), int(spin))
+            long_window = [spin] + long_window[:19]
+
+    def test_unrelated_widget_is_still_locked_out_while_feed_is_alive(self):
+        self.state.update_results(self.stream[:20], table_name="Table1", source="API")
+        before = list(self.state.history)
+        unrelated = [(i * 17 + 5) % 37 for i in range(20)]
+        for _ in range(6):
+            self.state.update_results(unrelated, table_name="Table1", source="DOM")
+        # The live feed just applied data, so an unaligned window must never
+        # rewrite the visible history.
+        self.assertEqual(self.state.history, before)
+        self.assertEqual(self.state.live_resync_count, 0)
+        self.assertEqual(self.state.display_compare_batch, [])
+
+    def test_stale_anchor_recovers_once_and_keeps_scored_rounds(self):
+        clock = {"t": 1000.0}
+        with patch.object(roulette.time, "time", lambda: clock["t"]):
+            self._run_stale_anchor_recovery(clock)
+
+    def _run_stale_anchor_recovery(self, clock):
+        self.state.update_results(self.stream[:20], table_name="Table1", source="API")
+        # One real scored round.
+        self.assertTrue(self.feed_dom_widget([self.stream[20]] + self.stream[:19]))
+        self.assertEqual(len(self.state.display_compare_batch), 1)
+        self.assertEqual(len(self.state.neighbor_display_batch), 1)
+        self.assertEqual(len(self.state.neighbor1_display_batch), 1)
+        scored_actual = self.state.display_compare_batch[0]["actual"]
+
+        # The widget is replaced / the table restarts: every offered window is
+        # unrelated to the live head. This used to freeze the screen forever.
+        fresh = self.stream[21:41]
+        clock["t"] += roulette.LIVE_RESYNC_IDLE_SECONDS + 5.0
+        for _ in range(roulette.LIVE_RESYNC_CONFIRMATIONS - 1):
+            self.state.update_results(fresh, table_name="Table1", source="DOM")
+            self.assertEqual(self.state.live_resync_count, 0)
+
+        clock["t"] += 1.0
+        self.state.update_results(fresh, table_name="Table1", source="DOM")
+        self.assertEqual(self.state.live_resync_count, 1)
+        self.assertEqual(self.state.history, list(fresh[:20]))
+        self.assertIn("YENIDEN SENKRON", self.state.status)
+
+        # Already scored K1/K2/GECMIS data must survive the re-anchor.
+        self.assertEqual(len(self.state.display_compare_batch), 1)
+        self.assertEqual(self.state.display_compare_batch[0]["actual"], scored_actual)
+        self.assertEqual(len(self.state.neighbor_display_batch), 1)
+        self.assertEqual(len(self.state.neighbor1_display_batch), 1)
+        self.assertEqual(self.state.neighbor_stats_total["trials"], 1)
+        self.assertEqual(self.state.neighbor1_stats_total["trials"], 1)
+
+        # ...and live tracking continues from the re-anchored window.
+        clock["t"] += 5.0
+        for spin in self.stream[41:46]:
+            self.assertTrue(self.feed_dom_widget([spin] + self.state.history[:19]))
+            self.assertEqual(int(self.state.history[0]), int(spin))
+        self.assertEqual(len(self.state.display_compare_batch), 6)
+
+    def test_detect_new_front_still_requires_a_real_overlap(self):
+        history = [7, 14, 21, 28, 35, 3, 9, 18, 26, 1, 32, 5, 12, 30, 11, 24]
+        # One coincidentally equal number is not proof of a new spin.
+        self.assertEqual(roulette.detect_new_front(history, [7, 2, 4, 6, 8]), [])
+        # A genuine continuation of the same window is accepted.
+        self.assertEqual(
+            roulette.detect_new_front(history, [13] + history[:5]),
+            [13],
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

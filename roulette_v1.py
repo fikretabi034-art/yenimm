@@ -49,6 +49,24 @@ TAB_WALK_BLOCKED_TABLE_LABELS = (
     "POWERUP RULET", "POWERUP ROULETTE", "POWERUP ROULET",
     "POWER UP RULET", "POWER UP ROULETTE", "POWER UP ROULET",
 )
+# V2.9.42 live-freeze fix:
+# A visible recent-results strip can be much shorter than the live history
+# (5..8 numbers on several Pragmatic skins). Requiring a long fixed overlap
+# made those widgets unmatchable forever: the first read worked, every later
+# spin proved nothing and SON SAYI / SON20 / GEÇMİŞ / K1 / K2 froze.
+DOM_MIN_OVERLAP = 4
+# How many genuinely new spins a single live window may prove at once.
+DETECT_MAX_NEW = 12
+# V2.9.42 stale-anchor recovery: a complete window that keeps repeating
+# while the live head cannot be reconciled with it re-anchors SON20 once.
+LIVE_RESYNC_MIN_NUMBERS = 10
+LIVE_RESYNC_CONFIRMATIONS = 3
+# Only recover when the live feed itself has been silent for this long, and
+# never re-anchor more often than this. A healthy feed never reaches the
+# LIVE LOCK branch, so an idle gate keeps unrelated widgets from hijacking
+# the visible SON20.
+LIVE_RESYNC_IDLE_SECONDS = 20.0
+LIVE_RESYNC_COOLDOWN_SECONDS = 60.0
 DGA_FEED_WS_URL = "wss://dga.pragmaticplaylive.net/ws"
 DGA_DEFAULT_CASINO_ID = "ppcds00000003709"
 DGA_DEFAULT_CURRENCY = "TRY"
@@ -800,7 +818,18 @@ def choose_live_dom_candidate(candidates, current_history):
             "overlap": 0,
         }
 
-    threshold = max(5, min(8, len(current)))
+    # V2.9.42 live-freeze fix:
+    # A visible recent-results strip is often shorter than the live history
+    # (5..8 numbers on several Pragmatic skins). The old fixed threshold of
+    # 8 matching numbers made such a widget unmatchable forever: the very
+    # first (bootstrap) read worked, the next spin proved nothing and
+    # SON SAYI / SON20 / GEÇMİŞ / K1 / K2 froze on the same values.
+    # The candidate only has to prove a real contiguous continuation with
+    # DOM_MIN_OVERLAP numbers; the stricter LIVE LOCK in update_results()
+    # still guards the live history itself.
+    needed = min(DOM_MIN_OVERLAP, len(current))
+    max_shift = min(DETECT_MAX_NEW, max(0, 30 - DOM_MIN_OVERLAP))
+
     best = None
 
     for nums, meta in prepared:
@@ -810,17 +839,19 @@ def choose_live_dom_candidate(candidates, current_history):
             variants.append(("reverse", rev))
 
         for orientation, cand in variants:
-            max_shift = min(20, max(0, len(cand) - threshold))
-
             for shift in range(max_shift + 1):
                 max_cmp = min(len(current), len(cand) - shift, 20)
+
+                if max_cmp < needed:
+                    continue
+
                 overlap = 0
                 for i in range(max_cmp):
                     if cand[shift + i] != current[i]:
                         break
                     overlap += 1
 
-                if overlap < threshold:
+                if overlap < needed:
                     continue
 
                 relation = "ahead" if shift > 0 else "same"
@@ -930,10 +961,14 @@ def align_reference_to_live(current_history, reference_history, max_new=12):
     return best
 
 
-def detect_new_front(old_history, new_history, max_new=6):
+def detect_new_front(old_history, new_history, max_new=DETECT_MAX_NEW):
     """
     last20Results is newest-first. Detect how many new results were prepended.
     Returns newest-first new items.
+
+    The overlap test is intentionally short: a live widget may expose only a
+    handful of the most recent numbers. What protects the live history is the
+    exact contiguous match itself, not the length of the matched run.
     """
     old = list(old_history or [])
     new = list(new_history or [])
@@ -942,8 +977,18 @@ def detect_new_front(old_history, new_history, max_new=6):
 
     max_k = min(max_new, len(new))
     for k in range(1, max_k + 1):
-        overlap = min(len(new) - k, len(old))
-        if overlap >= 4 and new[k:k+overlap] == old[:overlap]:
+        remaining = len(new) - k
+        if remaining < 1:
+            # k == len(new) would compare two empty slices and "prove"
+            # a whole unrelated window as new. Never allow that.
+            continue
+        overlap = min(remaining, len(old))
+        # Match as many numbers as both sides actually expose, but never
+        # accept a single coincidental number as proof of a new spin.
+        needed = min(DOM_MIN_OVERLAP, len(old), remaining)
+        if overlap < needed:
+            continue
+        if new[k:k+overlap] == old[:overlap]:
             return new[:k]
     return []
 
@@ -4330,6 +4375,18 @@ class RouletteState:
         self.last_live_result_number = None
         self.last_live_result_time = 0.0
 
+        # V2.9.42 stale-anchor recovery.
+        # A live window that cannot prove newest-first continuity is never
+        # allowed to rewrite SON SAYI/SON20 on its own. But when the very same
+        # complete window keeps coming back while the current head cannot be
+        # reconciled with it at all, the anchor itself went stale and the
+        # display would freeze forever. Those cases re-anchor once, visibly.
+        self.live_resync_window = []
+        self.live_resync_seen = 0
+        self.live_resync_count = 0
+        self.last_live_apply = 0.0
+        self.last_resync_at = 0.0
+
         self.pragmatic_table_id = ""
         self.pragmatic_operator_game_id = ""
         self.pragmatic_theme_code = ""
@@ -5892,6 +5949,71 @@ class RouletteState:
             self._save_learning()
 
 
+    def _note_live_resync(self, window, source=""):
+        """V2.9.42: re-anchor a provably stale live history.
+
+        The LIVE LOCK never lets an unproven window rewrite SON SAYI/SON20.
+        Without an escape hatch one bad read (replaced widget, restarted
+        table, mis-oriented list) froze the whole GECMIS/K1/K2 view: the app
+        kept showing the same first hand forever.
+
+        Recovery rule (deliberately strict):
+          * the window must be complete (>= LIVE_RESYNC_MIN_NUMBERS numbers),
+          * the exact same window must arrive LIVE_RESYNC_CONFIRMATIONS times,
+          * only then is the visible SON20 re-anchored to that window.
+        No result is invented and no round is re-scored: the already recorded
+        K1/K2/GECMIS batches stay untouched.
+        """
+        try:
+            window = [
+                int(x) for x in (window or [])
+                if str(x).lstrip("-").isdigit() and 0 <= int(x) <= 36
+            ][:20]
+        except Exception:
+            return False
+
+        if len(window) < LIVE_RESYNC_MIN_NUMBERS:
+            self.live_resync_window = []
+            self.live_resync_seen = 0
+            return False
+
+        if self.live_resync_window != window:
+            self.live_resync_window = list(window)
+            self.live_resync_seen = 1
+            return False
+
+        self.live_resync_seen += 1
+        if self.live_resync_seen < LIVE_RESYNC_CONFIRMATIONS:
+            return False
+
+        now = time.time()
+        if now - float(self.last_live_apply or 0.0) < LIVE_RESYNC_IDLE_SECONDS:
+            # The live feed is alive; an unaligned window here is not a stale
+            # anchor. Leave the visible history alone.
+            self.live_resync_seen = 0
+            self.live_resync_window = []
+            return False
+        if now - float(self.last_resync_at or 0.0) < LIVE_RESYNC_COOLDOWN_SECONDS:
+            self.live_resync_seen = 0
+            self.live_resync_window = []
+            return False
+
+        self.live_resync_seen = 0
+        self.live_resync_window = []
+        self.live_resync_count = int(self.live_resync_count or 0) + 1
+        self.last_resync_at = now
+        self.history = list(window)
+        self.pending_prediction = self._make_prediction(self.history)
+        self.roulette_seen = True
+        self.last_update = time.time()
+        self.source = f"{str(source or 'CANLI')[:60]} • YENIDEN SENKRON"
+        self.status = "CANLI • YENIDEN SENKRON"
+        try:
+            self._save_learning()
+        except Exception:
+            pass
+        return True
+
     def update_results(self, results, hot=None, cold=None, table_name="", source="API"):
         clean = []
         for x in results or []:
@@ -5916,6 +6038,7 @@ class RouletteState:
                 self.history = clean[:20]
                 if incoming_table:
                     self.table_name = incoming_table
+                self.last_live_apply = time.time()
                 self._set_table_paths(self.table_name)
                 self._try_load_learning(self.table_name, self.history)
             else:
@@ -5930,6 +6053,7 @@ class RouletteState:
                     self._save_learning()
                     self.table_name = incoming_table
                     self.history = clean[:20]
+                    self.last_live_apply = time.time()
                     self.loaded_table = None
                     self._set_table_paths(self.table_name)
                     self._try_load_learning(self.table_name, self.history)
@@ -5949,6 +6073,7 @@ class RouletteState:
                         self.history = clean[:20]
                         # Recalculate once with the exact received last20.
                         self.pending_prediction = self._make_prediction(self.history)
+                        self.last_live_apply = time.time()
                         self._save_learning()
                     elif clean[:20] == self.history:
                         pass
@@ -5961,6 +6086,11 @@ class RouletteState:
                         #
                         # The data source may still be used elsewhere for
                         # archive/model analysis, but live history stays intact.
+                        #
+                        # V2.9.42: a provably stale anchor used to freeze the
+                        # screen forever here. Offer the window to the
+                        # self-heal check before giving up on it.
+                        self._note_live_resync(clean[:20], source)
                         return
 
             if hot:
@@ -6007,6 +6137,7 @@ class RouletteState:
             self.session_results.append(n)
             self.history = [n] + list(self.history[:19])
             self.pending_prediction = self._make_prediction(self.history)
+            self.last_live_apply = time.time()
             self.source = str(source)
             self.roulette_seen = True
             self.status = "CANLI • SONUÇ EKRANI SENKRON"
@@ -12235,7 +12366,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.41 • SON500 Kilit Oku")
+        self.root.title("Roulette Pro AI V2.9.42 • CANLI DONMA DÜZELTMESİ")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -12406,7 +12537,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.41 KİLİT OKU",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.42 CANLI DÜZELTME",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")
@@ -14195,8 +14326,18 @@ class App:
                 if str(r.get("compare_result","")) in ("KAÇTI","DIŞI")
             )
 
+            k1_wins = sum(
+                1 for r in cmp_rows
+                if (r.get("neighbor1_bet") or {}).get("any_neighbor_hit")
+            )
+            k2_wins = sum(
+                1 for r in cmp_rows
+                if (r.get("neighbor_bet") or {}).get("any_neighbor_hit")
+            )
             rows = [
                 f"SERİ {len(cmp_rows)}/12 • NET {ana_hits} • YEDEK {yan_hits} • DIŞI {misses}"
+                f" • K1 KAZANDI {k1_wins}/{len(cmp_rows)}"
+                f" • K2 KAZANDI {k2_wins}/{len(cmp_rows)}"
             ]
 
             for i, r in enumerate(cmp_rows, 1):
@@ -14219,11 +14360,11 @@ class App:
                 result = str(r.get("compare_result") or "DIŞI")
 
                 if result in ("ANA","ORTAK"):
-                    result_txt = "NET ✓"
+                    result_txt = "KAZANDI • NET"
                 elif result in ("YAN","ADAY"):
-                    result_txt = "YEDEK ✓"
+                    result_txt = "KAZANDI • YEDEK"
                 else:
-                    result_txt = "DIŞI"
+                    result_txt = "KAYBETTİ • DIŞI"
 
                 side_txt = "/".join(f"{n:02d}" for n in side_nums) or "--"
 
@@ -14252,10 +14393,22 @@ class App:
                 if top5_src:
                     source_hit_txt += " • K:T5 " + ",".join(top5_src)
 
+                k1_bet = r.get("neighbor1_bet") or {}
+                k2_bet = r.get("neighbor_bet") or {}
+                k1_txt = (
+                    "K1 KAZANDI" if k1_bet.get("any_neighbor_hit")
+                    else "K1 KAYBETTİ" if k1_bet else "K1 --"
+                )
+                k2_txt = (
+                    "K2 KAZANDI" if k2_bet.get("any_neighbor_hit")
+                    else "K2 KAYBETTİ" if k2_bet else "K2 --"
+                )
+
                 rows.append(
                     f"{i:02d} | NET {main_n:02d} | "
                     f"YEDEK {side_txt} | "
                     f"ÇIKAN {actual_n:02d} | {result_txt}"
+                    + f" | {k1_txt} | {k2_txt}"
                     + source_hit_txt
                 )
 
@@ -14296,12 +14449,23 @@ class App:
         nb1_multi = int(nb1_stats.get("multi_hits",0) or 0)
         nb1_cov = float(nb1_stats.get("avg_coverage",0.0) or 0.0)
 
+        son_tur1 = ""
+        if isinstance(last_k1, dict):
+            son_tur1 = (
+                "SON TUR: K1 "
+                + ("KAZANDI" if last_k1.get("won") else "KAYBETTİ")
+                + f" • ÇIKAN {int(last_k1.get('actual',0) or 0):02d}"
+                + f" • NET {int(last_k1.get('net',0) or 0):02d}"
+                + f" • KAPSAM {int(last_k1.get('coverage',0) or 0)}/37\n"
+            )
+
         if nb1_trials:
             nb1_random_cover_pct = nb1_cov / 37.0 * 100.0
             nb1_actual_any_pct = nb1_any / nb1_trials * 100.0
             self.neighbor1_summary.config(
                 text=(
-                    f"K1 TOPLAM {nb1_any}/{nb1_trials} %{nb1_actual_any_pct:.1f}\n"
+                    son_tur1
+                    + f"K1 TOPLAM {nb1_any}/{nb1_trials} %{nb1_actual_any_pct:.1f}\n"
                     f"NET katkı {nb1_net} • YEDEK katkı {nb1_backup} • "
                     f"ÇOKLU {nb1_multi}\n"
                     f"ORT. KAPSAM {nb1_cov:.1f}/37 • "
@@ -14309,7 +14473,10 @@ class App:
                 )
             )
         else:
-            self.neighbor1_summary.config(text="Henüz 1 komşu istatistiği yok.")
+            self.neighbor1_summary.config(
+                text=(son_tur1 + "Henüz 1 komşu istatistiği yok.") if son_tur1
+                else "Henüz 1 komşu istatistiği yok."
+            )
 
         pending_nb1 = s.get("pending_compare") or {}
         if pending_nb1:
@@ -14339,8 +14506,8 @@ class App:
                 1 for r in nb1_rows if r.get("any_neighbor_hit")
             )
             nb1_lines = [
-                f"SERİ {len(nb1_rows)}/12 • K1 TUTTU {nb1_hit_count} • "
-                f"DIŞI {len(nb1_rows)-nb1_hit_count}"
+                f"SERİ {len(nb1_rows)}/12 • K1 KAZANDI {nb1_hit_count} • "
+                f"K1 KAYBETTİ {len(nb1_rows)-nb1_hit_count}"
             ]
 
             for i,r in enumerate(nb1_rows,1):
@@ -14353,11 +14520,11 @@ class App:
                 result1 = str(r.get("result") or "DIŞI")
 
                 if result1 == "NET K1":
-                    rtxt1 = "NET K1 ✓"
+                    rtxt1 = "KAZANDI • NET K1"
                 elif result1 == "YEDEK K1":
-                    rtxt1 = "YEDEK K1 ✓"
+                    rtxt1 = "KAZANDI • YEDEK K1"
                 else:
-                    rtxt1 = "DIŞI"
+                    rtxt1 = "KAYBETTİ • DIŞI"
 
                 multi1 = ""
                 if len(hitc1) >= 2:
@@ -14385,12 +14552,23 @@ class App:
         nb_multi = int(nb_stats.get("multi_hits",0) or 0)
         nb_cov = float(nb_stats.get("avg_coverage",0.0) or 0.0)
 
+        son_tur2 = ""
+        if isinstance(last_k2, dict):
+            son_tur2 = (
+                "SON TUR: K2 "
+                + ("KAZANDI" if last_k2.get("won") else "KAYBETTİ")
+                + f" • ÇIKAN {int(last_k2.get('actual',0) or 0):02d}"
+                + f" • NET {int(last_k2.get('net',0) or 0):02d}"
+                + f" • KAPSAM {int(last_k2.get('coverage',0) or 0)}/37\n"
+            )
+
         if nb_trials:
             random_cover_pct = nb_cov / 37.0 * 100.0
             actual_any_pct = nb_any / nb_trials * 100.0
             self.neighbor_summary.config(
                 text=(
-                    f"K2 TOPLAM {nb_any}/{nb_trials} %{actual_any_pct:.1f}\n"
+                    son_tur2
+                    + f"K2 TOPLAM {nb_any}/{nb_trials} %{actual_any_pct:.1f}\n"
                     f"NET katkı {nb_net} • YEDEK katkı {nb_backup} • "
                     f"ÇOKLU {nb_multi}\n"
                     f"ORT. KAPSAM {nb_cov:.1f}/37 • "
@@ -14398,7 +14576,10 @@ class App:
                 )
             )
         else:
-            self.neighbor_summary.config(text="Henüz komşu istatistiği yok.")
+            self.neighbor_summary.config(
+                text=(son_tur2 + "Henüz komşu istatistiği yok.") if son_tur2
+                else "Henüz komşu istatistiği yok."
+            )
 
         pending_nb = s.get("pending_compare") or {}
         if pending_nb:
@@ -14426,7 +14607,8 @@ class App:
         if nb_rows:
             hit_count = sum(1 for r in nb_rows if r.get("any_neighbor_hit"))
             rows = [
-                f"SERİ {len(nb_rows)}/12 • K2 TUTTU {hit_count} • DIŞI {len(nb_rows)-hit_count}"
+                f"SERİ {len(nb_rows)}/12 • K2 KAZANDI {hit_count} • "
+                f"K2 KAYBETTİ {len(nb_rows)-hit_count}"
             ]
 
             for i,r in enumerate(nb_rows,1):
@@ -14439,11 +14621,11 @@ class App:
                 result = str(r.get("result") or "DIŞI")
 
                 if result == "NET K2":
-                    result_txt = "NET K2 ✓"
+                    result_txt = "KAZANDI • NET K2"
                 elif result == "YEDEK K2":
-                    result_txt = "YEDEK K2 ✓"
+                    result_txt = "KAZANDI • YEDEK K2"
                 else:
-                    result_txt = "DIŞI"
+                    result_txt = "KAYBETTİ • DIŞI"
 
                 multi_txt = ""
                 if len(hit_centers) >= 2:

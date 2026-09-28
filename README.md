@@ -7,3 +7,27 @@ Her masa kendi `tableId` kimliğiyle, kullanıcının `PragmaticRouletteTracker`
 **GEÇMİŞ, 1 KOMŞU, 2 KOMŞU** karşılaştırmaları yalnızca *önceden gösterilmiş tahminin ardından doğrulanmış gerçek sonuçlarla* puanlanır. Toplanan eski 500 spin geçmişe dönük tahmin başarısı olarak sayılmaz. Bu üç görünümün son 12'lik listeleri uygulama yeniden açıldığında da geri gelir. Rastgele rulette geçmiş frekanslar gelecekteki sonuçları garanti etmez.
 
 Çevrimdışı regresyon testleri: `python -m unittest -v test_roulette_refresh.py`. Tarayıcı/oyun sitesinin canlı davranışı bu testlerde simüle edilmez.
+
+
+## V2.9.42 — CANLI DONMA DÜZELTMESİ (GEÇMİŞ / K1 / K2)
+
+Masa açıldığında SON SAYI ve SON 20 doğru görünüp bir el sonra ekranın aynı kalmasının
+nedeni, bazı Pragmatic görünümlerinde **sadece 5–8 sayı gösteren** "son sonuçlar" şeridine
+8 sayılık kesin eşleşme isteyen aday seçiciydi: ilk okuma çalışıyor, sonraki her el için
+hiçbir aday seçilemiyor ve canlı akış tamamen duruyordu.
+
+Yapılanlar:
+
+* `choose_live_dom_candidate` artık kısa şeritlerle de çalışır (en az 4 sayılık gerçek
+  kesinti kanıtı). Canlı geçmişin koruması yine `update_results` içindeki LIVE LOCK'ta.
+* `detect_new_front` boş dilim karşılaştırmasını (ilişkisiz bir listeyi "yeni" sayma)
+  kabul etmiyor; yalnızca gerçekten aynı pencerenin devamını yeniler.
+* Bir kez bozulan canlı çapa için güvenli kurtarma eklendi: aynı tam pencere üst üste
+  geliyorsa ve canlı akış 20 saniyedir sessizse SON 20 bir kez yeniden çapalanır.
+  Kazanılan/kaybedilen turlar, K1/K2 istatistikleri ve listeleri bozulmaz.
+* GEÇMİŞ sekmesindeki her satırda artık **KAZANDI / KAYBETTİ** bilgisi açıkça yazıyor ve
+  her tur için **K1** ve **K2** sonucu ayrı ayrı görünüyor. 1 KOMŞU / 2 KOMŞU sekmelerinin
+  satırları ve özetinde de "K1 KAZANDI / K1 KAYBETTİ" ifadesi var, ayrıca "SON TUR" satırı
+  son elin K1 ve K2 sonucunu gösteriyor.
+
+Çevrimdışı regresyon testleri: `python -m unittest -v test_roulette_refresh.py`
