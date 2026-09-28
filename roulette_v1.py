@@ -61,6 +61,9 @@ DETECT_MAX_NEW = 12
 # while the live head cannot be reconciled with it re-anchors SON20 once.
 LIVE_RESYNC_MIN_NUMBERS = 10
 LIVE_RESYNC_CONFIRMATIONS = 3
+# V2.9.43: a complete game window may bootstrap the live view when there is
+# no live history yet. The LIVE LOCK still protects an established SON20.
+LIVE_BOOTSTRAP_MIN_NUMBERS = 20
 # Only recover when the live feed itself has been silent for this long, and
 # never re-anchor more often than this. A healthy feed never reaches the
 # LIVE LOCK branch, so an idle gate keeps unrelated widgets from hijacking
@@ -883,6 +886,27 @@ def choose_live_dom_candidate(candidates, current_history):
     best.pop("_score", None)
     return best
 
+
+
+def orient_window_newest_first(window, badge=None):
+    """V2.9.43: return a result window in newest-first order.
+
+    Some Pragmatic/operator endpoints answer oldest-first. When the live
+    winning-number badge has been read from the game screen it is decisive:
+    the badge always sits at the newest end of the window.
+    """
+    w = [int(x) for x in (window or [])]
+    if len(w) < 2:
+        return w
+    try:
+        b = int(badge)
+    except Exception:
+        return w
+    if b in (w[0], w[1], w[2]):
+        return w
+    if b in (w[-1], w[-2], w[-3]):
+        return list(reversed(w))
+    return w
 
 
 def align_reference_to_live(current_history, reference_history, max_new=12):
@@ -4878,6 +4902,16 @@ class RouletteState:
         with self.lock:
             current = list(self.history[:20])
 
+            # V2.9.43: the very first window of a session has no live history
+            # to anchor it, and the stored archive may belong to another day.
+            # When the game's winning-number badge is readable it decides the
+            # orientation, because some endpoints answer oldest-first.
+            if not current:
+                clean = orient_window_newest_first(
+                    clean,
+                    self.last_live_result_number,
+                )
+
             # V2.8.1:
             # First try a strict contiguous alignment against the actual live
             # history. This both determines orientation and identifies ONLY
@@ -4899,18 +4933,43 @@ class RouletteState:
                     live_alignment.get("new_items", [])
                 )
             elif current and len(clean) >= min(5, len(current)):
-                # Archive-only orientation fallback. This does NOT grant
-                # permission to mutate live SON20.
-                k = min(15, len(current), len(clean))
-                forward = sum(
-                    1 for a, b in zip(clean[:k], current[:k]) if a == b
+                # V2.9.43 oldest-first detection:
+                # A newest-first window PREPENDS new spins. An oldest-first
+                # window keeps the current head as its prefix and appends the
+                # new spins at the END. Only the game's own winning-number
+                # badge can prove which end is newest, so the flip requires
+                # that positive evidence plus a sane number of new spins.
+                badge = self.last_live_result_number
+                try:
+                    badge_n = int(badge) if badge is not None else None
+                except Exception:
+                    badge_n = None
+                head_match = (
+                    len(clean) >= len(current)
+                    and clean[:len(current)] == current
                 )
-                rev = list(reversed(clean))
-                reverse = sum(
-                    1 for a, b in zip(rev[:k], current[:k]) if a == b
-                )
-                if reverse > forward:
-                    clean = rev
+                tail = clean[len(current):] if head_match else []
+                if (
+                    badge_n is not None
+                    and tail
+                    and len(tail) <= DETECT_MAX_NEW
+                    and badge_n in tail[-3:]
+                ):
+                    clean = list(reversed(clean))
+                    verified_live_new = list(reversed(tail))
+                else:
+                    # Archive-only orientation fallback. This does NOT grant
+                    # permission to mutate live SON20.
+                    k = min(15, len(current), len(clean))
+                    forward = sum(
+                        1 for a, b in zip(clean[:k], current[:k]) if a == b
+                    )
+                    rev = list(reversed(clean))
+                    reverse = sum(
+                        1 for a, b in zip(rev[:k], current[:k]) if a == b
+                    )
+                    if reverse > forward:
+                        clean = rev
 
             incoming_table = str(self._storage_identity(table_name or self.table_name or ""))
 
@@ -4929,11 +4988,49 @@ class RouletteState:
             base = previous_500 or self.table_long_history[:500]
             added = detect_new_front_large(base, clean, max_new=500)
             extended = (len(clean) > len(base) and clean[:len(base)] == base)
+
             if base and clean != base and not added and not extended:
-                # A later stale/disjoint response must not erase the last
-                # verified SON500 or contaminate the same-table long archive.
-                self.table_history_source = "MASA SON500: örtüşme doğrulanamadı"
-                return
+                # V2.9.43: the network statisticHistory list can arrive
+                # oldest-first while the stored archive is newest-first.
+                # Try the mirrored window before rejecting the response.
+                flipped = list(reversed(clean))
+                flipped_added = detect_new_front_large(base, flipped, max_new=500)
+                flipped_extended = (
+                    len(flipped) > len(base) and flipped[:len(base)] == base
+                )
+                if flipped_added or flipped_extended:
+                    clean = flipped
+                    added = flipped_added
+                    extended = flipped_extended
+
+            bootstrap_rebuild = False
+            if base and clean != base and not added and not extended:
+                if not self.history and len(clean) >= LIVE_BOOTSTRAP_MIN_NUMBERS:
+                    # V2.9.43 bootstrap authority:
+                    # There is no live view to protect. A complete window from
+                    # the game's own panel is the first usable view of this
+                    # table, so the stored archive is the stale side. Rebuild
+                    # from the verified window instead of freezing the whole
+                    # GEÇMİŞ/K1/K2 view at "SON: --" forever.
+                    self.table_long_history = []
+                    self.table_history_500 = []
+                    self.table_history_table = ""
+                    base = []
+                    added = []
+                    extended = False
+                    bootstrap_rebuild = True
+                    # The stored archive is the stale side, so it cannot tell
+                    # us the orientation. Use the game's own winning-number
+                    # badge when it is available.
+                    clean = orient_window_newest_first(
+                        clean,
+                        self.last_live_result_number,
+                    )
+                else:
+                    # A later stale/disjoint response must not erase the last
+                    # verified SON500 or contaminate the same-table long archive.
+                    self.table_history_source = "MASA SON500: örtüşme doğrulanamadı"
+                    return
             if clean == previous_500 and not verified_live_new:
                 # HISTORY500_SCAN runs repeatedly. Rewriting the whole archive
                 # and recomputing walk-forward on every identical reply held
@@ -4958,10 +5055,14 @@ class RouletteState:
             self.table_history_500 = clean
             self.table_history_table = incoming_table
             self.table_history_last_update = time.time()
-            self.table_history_source = f"{source_label}: {len(clean)}/500"
+            self.table_history_source = (
+                f"{source_label}: {len(clean)}/500"
+                + (" • İLK CANLI GÖRÜNÜM" if bootstrap_rebuild else "")
+            )
             self.table_long_source = (
                 f"UZUN MASA ARŞİVİ: {len(self.table_long_history)}"
                 + (f" (+{added_count})" if added_count else "")
+                + (" • ARŞİV YENİDEN KURULDU" if bootstrap_rebuild else "")
             )
 
             save_table_long_archive(
@@ -6014,6 +6115,35 @@ class RouletteState:
             pass
         return True
 
+    def _orient_live_window(self, window):
+        """V2.9.43: decide the order of the first live window.
+
+        Used only while the live history is still empty. A mis-ordered
+        oldest-first widget would start SON SAYI/SON20 reversed, and every
+        later window would then fail to prove continuity -- the screen would
+        freeze on the oldest number forever. Two independent signals decide:
+        the game's own winning-number badge, and the table's SON500 archive.
+        """
+        clean = [int(x) for x in (window or [])]
+        oriented = orient_window_newest_first(
+            clean,
+            self.last_live_result_number,
+        )
+        if oriented != clean:
+            return oriented
+
+        for reference in (self.table_history_500, self.table_long_history):
+            ref = [int(x) for x in (reference or [])[:60]]
+            if len(ref) < 5 or len(clean) < 5:
+                continue
+            k = min(15, len(clean), len(ref))
+            rev = list(reversed(clean))
+            forward = sum(1 for a, b in zip(clean[:k], ref[:k]) if a == b)
+            reverse = sum(1 for a, b in zip(rev[:k], ref[:k]) if a == b)
+            if reverse > forward and reverse >= 4:
+                return rev
+        return clean
+
     def update_results(self, results, hot=None, cold=None, table_name="", source="API"):
         clean = []
         for x in results or []:
@@ -6035,7 +6165,7 @@ class RouletteState:
 
             # First usable data.
             if not self.history:
-                self.history = clean[:20]
+                self.history = self._orient_live_window(clean[:20])
                 if incoming_table:
                     self.table_name = incoming_table
                 self.last_live_apply = time.time()
@@ -6052,7 +6182,7 @@ class RouletteState:
                     # its own long-term history brain.
                     self._save_learning()
                     self.table_name = incoming_table
-                    self.history = clean[:20]
+                    self.history = self._orient_live_window(clean[:20])
                     self.last_live_apply = time.time()
                     self.loaded_table = None
                     self._set_table_paths(self.table_name)
@@ -12366,7 +12496,7 @@ class App:
         self._restart_in_progress = False
 
         self.root = tk.Tk()
-        self.root.title("Roulette Pro AI V2.9.42 • CANLI DONMA DÜZELTMESİ")
+        self.root.title("Roulette Pro AI V2.9.43 • CANLI GÖRÜNÜM DÜZELTMESİ")
         self.root.configure(bg=self.BG)
         self.root.attributes("-topmost", True)
 
@@ -12537,7 +12667,7 @@ class App:
         head = tk.Frame(self.root,bg=self.BG)
         head.pack(fill="x",padx=10,pady=(7,4))
         tk.Label(head,text="ROULETTE PRO AI",font=("Segoe UI",14,"bold"),fg=self.TEXT,bg=self.BG).pack(side="left")
-        tk.Label(head,text="V2.9.42 CANLI DÜZELTME",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
+        tk.Label(head,text="V2.9.43 CANLI GÖRÜNÜM DÜZELTMESİ",font=("Segoe UI",8,"bold"),fg=self.GREEN,bg=self.BG).pack(side="right")
         self.status = tk.Label(self.root,text="",font=("Segoe UI",1),fg=self.BG,bg=self.BG)
 
         master = tk.Frame(self.root,bg=self.PANEL,highlightthickness=1,highlightbackground="#292e36")

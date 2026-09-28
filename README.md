@@ -31,3 +31,33 @@ Yapılanlar:
   son elin K1 ve K2 sonucunu gösteriyor.
 
 Çevrimdışı regresyon testleri: `python -m unittest -v test_roulette_refresh.py`
+
+
+## V2.9.43 — CANLI GÖRÜNÜM DÜZELTMESİ (PRAGMATIC DIRECT 500/500)
+
+Canlı masada **`PRAGMATIC DIRECT: 500/500`** verisi gelmesine rağmen ekranın tamamen boş
+kalabildiği durum düzeltildi. Belirtiler: `MASA SON500: örtüşme doğrulanamadı`,
+`MASA ARŞİVİ: bekleniyor`, `SON: --`, `CANLI HAFİZA: 0 spin`, `CANLI SYNC: -`.
+
+Nedeni: `update_table_history_500`, diskteki uzun arşivle örtüşmeyen bir pencereyi reddeden
+erken `return` bloğundaydı ve bu blok canlı görünümü kuran bootstrap kodundan **önce**
+çalışıyordu. Arşiv başka bir güne/kanala ait olduğunda (veya en başta hiç arşiv yoksa)
+oyunun kendi 500'ü her taramada bir daha reddediliyor, ekran hiç açılmıyordu.
+
+Yapılanlar:
+
+* **İlk canlı görünüm yetkisi:** canlı geçmiş boşken ve gelen pencere en az
+  `LIVE_BOOTSTRAP_MIN_NUMBERS` (20) sayı içeriyorsa, doğrulanmış oyun penceresi
+  geçerli kabul edilir; uzun arşiv bu pencereden yeniden kurulur ve canlı görünüm
+  açılır. Durum etiketlerinde `• İLK CANLI GÖRÜNÜM` ve `• ARŞİV YENİDEN KURULDU` yazar.
+  Canlı geçmiş kurulduktan sonra LIVE LOCK tam olarak çalışmaya devam eder: örtüşmesi
+  doğrulanamayan pencere kurulmuş SON 20'yi değiştiremez.
+* **Yön tespiti:** bazı uç noktalar listeyi en eskiden en yeniye verir. Artık
+  `orient_window_newest_first` oyunun ekranındaki kazanan sayıdan (canlı sonuç
+  rozeti) yönü belirler; ayrıca masanın kendi SON500 arşivi bağımsız bir kanıt olarak
+  kullanılır. Böylece ters sıralı ilk pencere de doğru kurulur ve sonraki eller
+  donmadan ilerlemeye devam eder.
+* **Ayna penceresi kontrolü:** pencere reddedilmeden önce ters çevrilmiş hâli de
+  arşive karşı denenir; en eskiden en yeniye veren ağ yanıtı böylece tanınır.
+
+Çevrimdışı regresyon testleri: `python -m unittest -v test_roulette_refresh.py`
